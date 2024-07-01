@@ -610,7 +610,6 @@ class BaseGPTQForCausalLM(nn.Module, PushToHubMixin):
         # Parameters related to loading from Hugging Face Hub
         cache_dir = model_init_kwargs.pop("cache_dir", None)
         force_download = model_init_kwargs.pop("force_download", False)
-        resume_download = model_init_kwargs.pop("resume_download", False)
         proxies = model_init_kwargs.pop("proxies", None)
         local_files_only = model_init_kwargs.pop("local_files_only", False)
         use_auth_token = model_init_kwargs.pop("use_auth_token", None)
@@ -622,7 +621,6 @@ class BaseGPTQForCausalLM(nn.Module, PushToHubMixin):
             "cache_dir": cache_dir,
             "force_download": force_download,
             "proxies": proxies,
-            "resume_download": resume_download,
             "local_files_only": local_files_only,
             "use_auth_token": use_auth_token,
             "revision": revision,
@@ -723,7 +721,6 @@ class BaseGPTQForCausalLM(nn.Module, PushToHubMixin):
         # Parameters related to loading from Hugging Face Hub
         cache_dir = kwargs.pop("cache_dir", None)
         force_download = kwargs.pop("force_download", False)
-        resume_download = kwargs.pop("resume_download", False)
         proxies = kwargs.pop("proxies", None)
         local_files_only = kwargs.pop("local_files_only", False)
         use_auth_token = kwargs.pop("use_auth_token", None)
@@ -735,7 +732,6 @@ class BaseGPTQForCausalLM(nn.Module, PushToHubMixin):
             "cache_dir": cache_dir,
             "force_download": force_download,
             "proxies": proxies,
-            "resume_download": resume_download,
             "local_files_only": local_files_only,
             "use_auth_token": use_auth_token,
             "revision": revision,

@@ -127,7 +127,6 @@ class AutoGPTQForCausalLM:
             "cache_dir",
             "force_download",
             "proxies",
-            "resume_download",
             "local_files_only",
             "use_auth_token",
             "revision",

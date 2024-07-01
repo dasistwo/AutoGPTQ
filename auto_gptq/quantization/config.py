@@ -168,7 +168,6 @@ class BaseQuantizeConfig(PushToHubMixin):
         # Parameters related to loading from Hugging Face Hub
         cache_dir = kwargs.pop("cache_dir", None)
         force_download = kwargs.pop("force_download", False)
-        resume_download = kwargs.pop("resume_download", False)
         proxies = kwargs.pop("proxies", None)
         local_files_only = kwargs.pop("local_files_only", False)
         use_auth_token = kwargs.pop("use_auth_token", None)
@@ -191,7 +190,6 @@ class BaseQuantizeConfig(PushToHubMixin):
                     quantize_config_filename,
                     cache_dir=cache_dir,
                     force_download=force_download,
-                    resume_download=resume_download,
                     proxies=proxies,
                     use_auth_token=use_auth_token,
                     revision=revision,
