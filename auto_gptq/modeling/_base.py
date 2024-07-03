@@ -1,6 +1,10 @@
 import copy
 import logging
 import os
+import gc
+import functools
+import inspect
+from collections import defaultdict
 from os.path import isdir, join
 from typing import Dict, List, Optional, Union
 
@@ -8,6 +12,7 @@ import accelerate
 import torch
 import torch.nn as nn
 import transformers
+from datasets import load_dataset
 from accelerate.hooks import remove_hook_from_module
 from safetensors import safe_open
 from safetensors.torch import load_file as safe_load
@@ -100,6 +105,7 @@ class BaseGPTQForCausalLM(nn.Module, PushToHubMixin):
         model: PreTrainedModel,
         quantized: bool,
         quantize_config: BaseQuantizeConfig,
+        tokenizer: transformers.PreTrainedTokenizerBase,
         is_triton_backend: bool = False,
         injected_fused_attention: bool = False,
         injected_fused_mlp: bool = False,
@@ -111,6 +117,7 @@ class BaseGPTQForCausalLM(nn.Module, PushToHubMixin):
         self.model_type = self.model.config.model_type
         self._quantized = quantized
         self.quantize_config = quantize_config
+        self.tokenizer = tokenizer
         self.config = self.model.config
 
         self.is_triton_backend = is_triton_backend
@@ -125,6 +132,85 @@ class BaseGPTQForCausalLM(nn.Module, PushToHubMixin):
     @property
     def hf_device_map(self):
         return getattr(self.model, "hf_device_map", None)
+
+    def _prepare_examples_for_calibration(
+        self,
+        ds: Union[str, List[str], List[List[int]]] = "dailymail",
+        n_samples = 512,
+        block_size = 512,
+        split = "validation",
+        text_column = "article",        
+    ):
+        def _convert_tensor_to_list(tensor):
+            if isinstance(tensor, torch.Tensor):
+                if len(tensor.shape) == 1:
+                    tensor = tensor.unsqueeze(0)
+                tensor = tensor.long()
+                return tensor.cpu().numpy().tolist()
+            return [tensor]
+
+        if isinstance(ds, str):
+            if ds == "dailymail":
+                dataset = load_dataset("cnn_dailymail", "3.0.0", split=split)
+                # dataset = load_dataset("mit-han-lab/pile-val-backup", split=split)
+            else:
+                dataset = load_dataset(ds, split=split)
+
+            dataset = dataset.shuffle(seed=2024)
+
+        elif isinstance(ds, list):
+            if isinstance(ds[0], str):
+                dataset = [{text_column: text} for text in ds]
+            elif isinstance(ds[0][0], int):
+                dataset = ds
+            else:
+                raise NotImplementedError(
+                    "Either pass a string to a huggingface dataset or a list"
+                    "that is preprocessed with one sample of text per element"
+                    " or a list of list of int for tokenized words."
+                )
+        else:
+            raise NotImplementedError(
+                "Either pass a string to a huggingface dataset or a list"
+                "that is preprocessed with one sample of text per element"
+                " or a list of list of int for tokenized words."
+            )
+
+        gptq_samples = []
+        awq_samples = []
+        n_run = 0
+        for data in dataset:
+            line = data[text_column].strip()
+            line_batchencoded = self.tokenizer(line, max_length=block_size, truncation=True)
+            new_entry = {}
+            for k in line_batchencoded:
+                new_entry[k] = _convert_tensor_to_list(line_batchencoded[k])
+            keys = ["input_ids", "attention_mask"]
+            new_entry = {k: new_entry[k] for k in keys}
+            gptq_samples.append(new_entry)
+            awq_entry = torch.tensor([line_batchencoded["input_ids"]])
+            if awq_entry.numel != 0:
+                awq_samples.append(awq_entry)
+            n_run += 1
+            if n_run == n_samples:
+                break
+
+        pad_token_id = self.config.pad_token_id
+        if not pad_token_id:
+            pad_token_id = self.config.eos_token_id
+
+        gptq_samples = [
+            collate_data(gptq_samples[start : start + 1], pad_token_id)
+            for start in range(0, len(gptq_samples), 1)
+        ]
+
+        # now concatenate all samples and split according to block size
+        cat_samples = torch.cat(awq_samples, dim=1)
+        n_split = cat_samples.shape[1] // block_size
+        logging.debug(f" * Split into {n_split} blocks")
+        awq_samples = [cat_samples[:, i * block_size : (i + 1) * block_size] for i in range(n_split)]
+
+        return gptq_samples, awq_samples
 
     def _prepare_examples_for_quantization(
         self,
@@ -174,8 +260,6 @@ class BaseGPTQForCausalLM(nn.Module, PushToHubMixin):
     @torch.inference_mode()
     def quantize(
         self,
-        examples: List[Dict[str, Union[List[int], torch.LongTensor]]],
-        batch_size: int = 1,
         use_triton: bool = False,
         use_cuda_fp16: bool = True,
         autotune_warmup_after_quantized: bool = False,
@@ -206,7 +290,8 @@ class BaseGPTQForCausalLM(nn.Module, PushToHubMixin):
         layer_input_kwargs = []
         layer_outputs = []
 
-        examples = self._prepare_examples_for_quantization(examples, batch_size)
+        examples, _ = self._prepare_examples_for_calibration()
+        # examples = self._prepare_examples_for_quantization(examples, batch_size)
 
         forward_pass_use_cache = self.model.config.use_cache
         self.model.config.use_cache = False
@@ -296,6 +381,7 @@ class BaseGPTQForCausalLM(nn.Module, PushToHubMixin):
             for names in inside_layer_modules:
                 subset = {n: full[n] for n in names if n in full}
                 gptq = {}
+                input_feat = defaultdict(list)
                 for name in subset:
                     gptq[name] = GPTQ(subset[name])
                     gptq[name].quantizer.configure(
@@ -317,7 +403,7 @@ class BaseGPTQForCausalLM(nn.Module, PushToHubMixin):
                     handles.append(subset[name].register_forward_hook(add_batch(name)))
                 for j in range(num_batches):
                     layer_input = []
-                    for k, layer_inp in enumerate(layer_inputs[j]):
+                    for layer_inp in layer_inputs[j]:
                         layer_input.append(move_to_device(layer_inp, cur_layer_device))
 
                     layer_attention_mask = move_to_device(attention_masks[j], cur_layer_device)
@@ -333,6 +419,17 @@ class BaseGPTQForCausalLM(nn.Module, PushToHubMixin):
                 for h in handles:
                     h.remove()
 
+                gc.collect()
+                torch.cuda.empty_cache()
+
+                # TODO: Put the AWQ algorithm here
+                logger.info(f"Start scaling and clipping for layer {i + 1}/{len(layers)}...")
+                
+                # Compute and apply scale for certain linears
+                
+                
+                # Compute and apply clipping
+                
                 for name in subset:
                     logger.info(f"Quantizing {name} in layer {i + 1}/{len(layers)}...")
                     scale, zero, g_idx = gptq[name].fasterquant(
@@ -351,7 +448,7 @@ class BaseGPTQForCausalLM(nn.Module, PushToHubMixin):
 
             for j in range(num_batches):
                 layer_input = []
-                for k, layer_inp in enumerate(layer_inputs[j]):
+                for layer_inp in layer_inputs[j]:
                     layer_input.append(move_to_device(layer_inp, cur_layer_device))
 
                 layer_attention_mask = move_to_device(attention_masks[j], cur_layer_device)
@@ -573,6 +670,7 @@ class BaseGPTQForCausalLM(nn.Module, PushToHubMixin):
         self.quantize_config.save_pretrained(save_dir)
         self.quantize_config.model_name_or_path = save_dir
         self.quantize_config.model_file_base_name = model_base_name
+        self.tokenizer.save_pretrained(save_dir)
 
     def save_pretrained(
         self,
@@ -668,6 +766,7 @@ class BaseGPTQForCausalLM(nn.Module, PushToHubMixin):
 
         merged_kwargs = {**model_init_kwargs, **cached_file_kwargs}
         model = AutoModelForCausalLM.from_pretrained(pretrained_model_name_or_path, **merged_kwargs)
+        tokenizer = transformers.AutoTokenizer.from_pretrained(pretrained_model_name_or_path)
 
         model_config = model.config.to_dict()
         seq_len_keys = ["max_position_embeddings", "seq_length", "n_positions"]
@@ -681,7 +780,7 @@ class BaseGPTQForCausalLM(nn.Module, PushToHubMixin):
             model.seqlen = 4096
         model.eval()
 
-        return cls(model, False, quantize_config)
+        return cls(model, False, quantize_config, tokenizer)
 
     @classmethod
     def from_quantized(
@@ -1230,10 +1329,13 @@ class BaseGPTQForCausalLM(nn.Module, PushToHubMixin):
         #     use_qigen=use_qigen,
         # )
 
+        tokenizer = transformers.AutoTokenizer.from_pretrained(model_name_or_path, config=config, trust_remote_code=trust_remote_code)
+
         return cls(
             model,
             True,
             quantize_config,
+            tokenizer,
             is_triton_backend=use_triton or use_tritonv2,
             injected_fused_attention=inject_fused_attention,
             injected_fused_mlp=inject_fused_mlp and (use_triton or use_tritonv2),
