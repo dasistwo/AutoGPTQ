@@ -69,6 +69,8 @@ from ._utils import (
     preprocess_checkpoint_qigen,
     simple_dispatch_model,
     unpack_awq,
+    apply_awq_clip,
+    apply_awq_scale,
 )
 
 
@@ -135,11 +137,11 @@ class BaseGPTQForCausalLM(nn.Module, PushToHubMixin):
 
     def _prepare_examples_for_calibration(
         self,
-        ds: Union[str, List[str], List[List[int]]] = "dailymail",
-        n_samples = 512,
+        ds: Union[str, List[str], List[List[int]]] = "pileval",
+        n_samples = 128,
         block_size = 512,
         split = "validation",
-        text_column = "article",        
+        text_column = "text",        
     ):
         def _convert_tensor_to_list(tensor):
             if isinstance(tensor, torch.Tensor):
@@ -150,13 +152,13 @@ class BaseGPTQForCausalLM(nn.Module, PushToHubMixin):
             return [tensor]
 
         if isinstance(ds, str):
-            if ds == "dailymail":
-                dataset = load_dataset("cnn_dailymail", "3.0.0", split=split)
-                # dataset = load_dataset("mit-han-lab/pile-val-backup", split=split)
+            if ds == "pileval":
+                # dataset = load_dataset("cnn_dailymail", "3.0.0", split=split)
+                dataset = load_dataset("mit-han-lab/pile-val-backup", split=split)
             else:
                 dataset = load_dataset(ds, split=split)
 
-            dataset = dataset.shuffle(seed=2024)
+            dataset = dataset.shuffle(seed=42)
 
         elif isinstance(ds, list):
             if isinstance(ds[0], str):
@@ -176,12 +178,16 @@ class BaseGPTQForCausalLM(nn.Module, PushToHubMixin):
                 " or a list of list of int for tokenized words."
             )
 
+        # TODO: Merge two types of samples after finding a way to handle the tokenized samples.
+
         gptq_samples = []
         awq_samples = []
         n_run = 0
         for data in dataset:
             line = data[text_column].strip()
-            line_batchencoded = self.tokenizer(line, max_length=block_size, truncation=True)
+            line_batchencoded = self.tokenizer(line, truncation=True)
+            if len(line_batchencoded["attention_mask"]) > block_size:
+                continue
             new_entry = {}
             for k in line_batchencoded:
                 new_entry[k] = _convert_tensor_to_list(line_batchencoded[k])
@@ -209,6 +215,7 @@ class BaseGPTQForCausalLM(nn.Module, PushToHubMixin):
         n_split = cat_samples.shape[1] // block_size
         logging.debug(f" * Split into {n_split} blocks")
         awq_samples = [cat_samples[:, i * block_size : (i + 1) * block_size] for i in range(n_split)]
+        awq_samples = torch.cat(awq_samples, dim=0)
 
         return gptq_samples, awq_samples
 
@@ -257,6 +264,63 @@ class BaseGPTQForCausalLM(nn.Module, PushToHubMixin):
 
         return new_examples
 
+    def get_layers_for_scaling(self,
+                               names: List[str],
+                               layermodule: nn.Module,
+                               input_feat: Dict[str, torch.Tensor],
+                            #    qdict: Dict[str, GPTQ],
+                               module_kwargs):
+        # Temporarily applied to llama-gemma model.
+        # TODO: Support the models at least in modeling folder.
+
+        # llama attention input
+        if any(name in names for name in {"self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"}):
+            return dict(
+                    prev_op=layermodule.input_layernorm,
+                    layers=[
+                        layermodule.self_attn.k_proj,
+                        layermodule.self_attn.v_proj,
+                        layermodule.self_attn.q_proj,
+                    ],
+                    inp=input_feat["self_attn.q_proj"],
+                    # qlist=[qdict["self_attn.q_proj"], qdict["self_attn.k_proj"], qdict["self_attn.v_proj"]],
+                    module2inspect=layermodule.self_attn,
+                    kwargs=module_kwargs,
+                )
+
+        # llama attention out
+        elif "self_attn.o_proj" in names:
+            # Please refer to https://github.com/mit-han-lab/llm-awq/pull/67#issue-1850622696
+            if layermodule.self_attn.v_proj.weight.shape == layermodule.self_attn.o_proj.weight.shape:
+                return dict(
+                        prev_op=layermodule.self_attn.v_proj,
+                        layers=[layermodule.self_attn.o_proj],
+                        # qlist=[qdict["self_attn.o_proj"]],
+                        inp=input_feat["self_attn.o_proj"],
+                    )
+
+        # llama linear 1
+        elif any(name in names for name in {"mlp.gate_proj", "mlp.up_proj"}):
+            return dict(
+                    prev_op=layermodule.post_attention_layernorm,
+                    layers=[layermodule.mlp.up_proj, layermodule.mlp.gate_proj],
+                    inp=input_feat["mlp.gate_proj"],
+                    # qlist=[qdict["mlp.gate_proj"], qdict["mlp.up_proj"]],
+                    module2inspect=layermodule.mlp,
+                )
+
+        # llama linear 2
+        elif "mlp.down_proj" in names:
+            return dict(
+                    prev_op=layermodule.mlp.up_proj,
+                    layers=[layermodule.mlp.down_proj],
+                    # qlist=[qdict["mlp.down_proj"]],
+                    inp=input_feat["mlp.down_proj"],
+                )
+
+        else:
+            raise ValueError(f"Unsupported layer names: {names}")
+
     @torch.inference_mode()
     def quantize(
         self,
@@ -285,12 +349,11 @@ class BaseGPTQForCausalLM(nn.Module, PushToHubMixin):
                     accelerate.cpu_offload_with_hook(module, CUDA_0)
 
         layer_inputs = []
-        attention_masks = []
-        position_ids = []
         layer_input_kwargs = []
         layer_outputs = []
 
-        examples, _ = self._prepare_examples_for_calibration()
+        # TODO: Merge two types of samples after finding a way to handle the tokenized samples.
+        examples, awq_examples = self._prepare_examples_for_calibration()
         # examples = self._prepare_examples_for_quantization(examples, batch_size)
 
         forward_pass_use_cache = self.model.config.use_cache
@@ -301,6 +364,9 @@ class BaseGPTQForCausalLM(nn.Module, PushToHubMixin):
 
         cur_layer_device = get_device(layers[0])
         data_device = cur_layer_device if cache_examples_on_gpu else CPU
+
+        # Store input hook saves the input, attention mask, and position ids of first layer.
+
         def store_input_hook(_, args, kwargs):
             # Positional arguments.
             layer_input = []
@@ -309,20 +375,9 @@ class BaseGPTQForCausalLM(nn.Module, PushToHubMixin):
             layer_inputs.append(layer_input)
 
             # Keyword arguments.
-            if kwargs["attention_mask"] is not None:
-                attention_masks.append(kwargs["attention_mask"].to(data_device))
-            else:
-                attention_masks.append(None)
-
-            pos_ids = kwargs.get("position_ids", None)
-            if pos_ids is not None:
-                position_ids.append(move_to_device(pos_ids, data_device))
             one_kwargs = {}
-            for (
-                k,
-                v,
-            ) in kwargs.items():  # make sure other arguments also be captured
-                if k not in ["hidden_states", "attention_mask", "position_ids"]:
+            for k, v in kwargs.items():  # make sure other arguments also be captured
+                if k != "hidden_states":
                     one_kwargs[k] = nested_move_to_device(v, data_device)
             layer_input_kwargs.append(one_kwargs)
             raise ValueError
@@ -364,6 +419,37 @@ class BaseGPTQForCausalLM(nn.Module, PushToHubMixin):
 
         torch.cuda.empty_cache()
 
+        awq_inputs=[]
+        awq_kwargs={}
+        def yet_another_store_input_hook(_, args, kwargs):
+            # Positional arguments.
+            if len(args) > 0:
+                hidden_states = args[0]
+                del args
+            else:
+                first_key = list(kwargs.keys())[0]
+                hidden_states = kwargs.pop(first_key)
+
+            awq_inputs.append(hidden_states)
+
+            # Keyword arguments.
+            awq_kwargs.update(kwargs)
+            raise ValueError
+
+        handle = layers[0].register_forward_pre_hook(yet_another_store_input_hook, with_kwargs=True)
+        try:
+            self.model(awq_examples.to(next(self.model.parameters()).device))
+        except ValueError:
+            pass
+        handle.remove()
+
+        awq_kwargs = self.model.prepare_inputs_for_generation(awq_examples, **awq_kwargs)
+        awq_kwargs.pop("input_ids")
+        awq_inputs = awq_inputs[0]
+
+        for i in range(min(len(examples), len(layer_input_kwargs))):
+            layer_input_kwargs[i] = self.model.prepare_inputs_for_generation(examples[i]['input_ids'], **layer_input_kwargs[i])
+
         inside_layer_modules = self.inside_layer_modules
         if not self.quantize_config.true_sequential:
             inside_layer_modules = [sum(inside_layer_modules, [])]
@@ -378,10 +464,65 @@ class BaseGPTQForCausalLM(nn.Module, PushToHubMixin):
             cur_layer_device = get_device(layer)
 
             full = find_layers(layer)
+
+            # TODO: Put the AWQ algorithm here
+            logger.info(f"Start scaling and clipping for layer {i + 1}/{len(layers)}...")
+            input_feat = defaultdict(list)
+
+            def get_input_per_linear(module, inp, out, name, feat_dict):
+                inp = inp[0]
+                inp = inp.detach().cpu()
+                feat_dict[name].append(inp)
+
+            handles = []
+            for k in full.keys():
+                handles.append(
+                    full[k].register_forward_hook(
+                        functools.partial(
+                            get_input_per_linear, name=k, feat_dict=input_feat
+                        )
+                    )
+                )
+
+            awq_inputs = awq_inputs.to(cur_layer_device)
+            real_params = inspect.signature(layer.forward).parameters
+            for k, v in awq_kwargs.items():
+                if k in real_params:
+                    awq_kwargs[k] = nested_move_to_device(v, cur_layer_device)
+            awq_inputs = layer(awq_inputs, **awq_kwargs)[0]
+
+            for h in handles:
+                h.remove()
+
+            # input_kwargs = {}
+            input_feat = {k: torch.cat(v, dim=0) for k, v in input_feat.items()}
+
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            linear_list = [
+                self.get_layers_for_scaling(names, layer, input_feat, awq_kwargs)
+                for names in inside_layer_modules
+            ]
+
+            for index, ll in enumerate(linear_list):
+                if ll is None:
+                    continue
+                scales = apply_awq_scale(self, **ll)
+                for n in inside_layer_modules[index]:
+                    input_feat[n].div_(scales.view(1, -1).to(input_feat[n].device))
+                del scales
+
+            for index, ll in enumerate(linear_list):
+                if ll is None:
+                    continue
+                apply_awq_clip(self, inside_layer_modules[index], ll['layers'], input_feat)
+            
+            del linear_list
+
             for names in inside_layer_modules:
                 subset = {n: full[n] for n in names if n in full}
                 gptq = {}
-                input_feat = defaultdict(list)
                 for name in subset:
                     gptq[name] = GPTQ(subset[name])
                     gptq[name].quantizer.configure(
@@ -405,16 +546,12 @@ class BaseGPTQForCausalLM(nn.Module, PushToHubMixin):
                     layer_input = []
                     for layer_inp in layer_inputs[j]:
                         layer_input.append(move_to_device(layer_inp, cur_layer_device))
+                    additional_layer_inputs = {}
 
-                    layer_attention_mask = move_to_device(attention_masks[j], cur_layer_device)
-                    additional_layer_inputs = {"attention_mask": layer_attention_mask}
-                    layer_position_ids = (
-                        None if not position_ids else move_to_device(position_ids[j], cur_layer_device)
-                    )
-                    if layer_position_ids is not None:
-                        additional_layer_inputs["position_ids"] = layer_position_ids
                     for k, v in layer_input_kwargs[j].items():
-                        additional_layer_inputs[k] = nested_move_to_device(v, cur_layer_device)
+                        additional_layer_inputs[k] = nested_move_to_device(
+                            v, cur_layer_device
+                        )
                     layer(*layer_input, **additional_layer_inputs)
                 for h in handles:
                     h.remove()
@@ -422,14 +559,6 @@ class BaseGPTQForCausalLM(nn.Module, PushToHubMixin):
                 gc.collect()
                 torch.cuda.empty_cache()
 
-                # TODO: Put the AWQ algorithm here
-                logger.info(f"Start scaling and clipping for layer {i + 1}/{len(layers)}...")
-                
-                # Compute and apply scale for certain linears
-                
-                
-                # Compute and apply clipping
-                
                 for name in subset:
                     logger.info(f"Quantizing {name} in layer {i + 1}/{len(layers)}...")
                     scale, zero, g_idx = gptq[name].fasterquant(
@@ -451,11 +580,6 @@ class BaseGPTQForCausalLM(nn.Module, PushToHubMixin):
                 for layer_inp in layer_inputs[j]:
                     layer_input.append(move_to_device(layer_inp, cur_layer_device))
 
-                layer_attention_mask = move_to_device(attention_masks[j], cur_layer_device)
-                additional_layer_inputs = {"attention_mask": layer_attention_mask}
-                layer_position_ids = None if not position_ids else move_to_device(position_ids[j], cur_layer_device)
-                if layer_position_ids is not None:
-                    additional_layer_inputs["position_ids"] = layer_position_ids
                 for k, v in layer_input_kwargs[j].items():
                     additional_layer_inputs[k] = nested_move_to_device(v, cur_layer_device)
                 layer_output = move_to_device(

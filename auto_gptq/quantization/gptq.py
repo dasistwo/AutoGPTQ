@@ -8,16 +8,17 @@ import torch.nn as nn
 import transformers
 
 from .quantizer import Quantizer
-
+from ..modeling._const import CUDA_0
 
 logger = getLogger(__name__)
 
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
+torch.cuda.set_device(CUDA_0)
 
 
 class GPTQ:
-    def __init__(self, layer):
+    def __init__(self, layer: nn.Linear):
         self.layer = layer
         self.dev = self.layer.weight.device
         W = layer.weight.data.clone()
@@ -167,8 +168,8 @@ class GPTQ:
                 logger.debug(torch.sum(Losses))
 
         torch.cuda.synchronize()
-        logger.info(f"duration: {(time.time() - tick)}")
-        logger.info(f"avg loss: {torch.sum(Losses).item() / self.nsamples}")
+        # logger.info(f"duration: {(time.time() - tick)}")
+        # logger.info(f"avg loss: {torch.sum(Losses).item() / self.nsamples}")
 
         group_size = group_size if group_size != -1 else self.columns
         if static_groups and actorder:

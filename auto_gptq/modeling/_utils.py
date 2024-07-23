@@ -1,8 +1,11 @@
 import json
 import logging
 import os
+import gc
 from logging import getLogger
-from typing import List, Optional, Union
+from typing import List, Optional, Union, Dict
+import functools
+import copy
 
 import accelerate
 import numpy as np
@@ -16,6 +19,7 @@ from transformers.utils.hub import cached_file
 
 from ..utils.import_utils import dynamically_import_QuantLinear
 from ..utils.modeling_utils import recurse_setattr
+from ..quantization import GPTQ
 from ._const import CPU, CUDA_0, EXLLAMA_DEFAULT_MAX_INPUT_LENGTH, SUPPORTED_MODELS
 
 
@@ -616,6 +620,335 @@ def unpack_awq(
 
     return fp16_weight, zeros
 
+def awq_pseudo_quantizer(self, w: torch.Tensor):
+    org_w_shape = w.shape
+    if self.quantize_config.group_size > 1:
+        assert org_w_shape[-1] % self.quantize_config.group_size == 0
+        w = w.view(-1, self.quantize_config.group_size)
+    assert w.dim() == 2
+    assert torch.isnan(w).sum() == 0, w
+    
+    # GPTQ always assumes zero point quantization
+    max_val = w.amax(dim=1, keepdim=True)
+    min_val = w.amin(dim=1, keepdim=True)
+    max_int = 2**self.quantize_config.bits - 1
+    min_int = 0
+    scales = (max_val - min_val).clamp(min=1e-5) / max_int
+    zeros = (-torch.round(min_val / scales)).clamp_(min_int, max_int)
+    w = (
+        torch.clamp(torch.round(w / scales) + zeros, min_int, max_int) - zeros
+    ) * scales
+    zeros = zeros.view(org_w_shape[0], -1)
+    
+    assert torch.isnan(scales).sum() == 0
+    assert torch.isnan(w).sum() == 0
+
+    scales = scales.view(org_w_shape[0], -1)
+    w = w.reshape(org_w_shape)
+
+    return w, scales, zeros
+
+
+@torch.no_grad()
+def apply_awq_scale(
+    self,
+    prev_op: nn.Module,
+    layers: List[nn.Linear],
+    inp: torch.Tensor,
+    # qlist: List[GPTQ],
+    module2inspect = None,
+    kwargs: dict = {},
+):
+    # Search best scale
+    if module2inspect is None:
+        assert len(layers) == 1
+        module2inspect = layers[0]
+
+    if "use_cache" in kwargs:
+        kwargs.pop("use_cache")
+
+    device = get_device(module2inspect)
+    assert torch.isnan(inp).sum() == 0, inp
+    inp = inp.to(device)
+    for v in kwargs:
+        if isinstance(kwargs[v], torch.Tensor):
+            kwargs[v] = kwargs[v].to(device)
+
+    # Compute Per-channel mean of normalized weights
+    # All layer weights are concatted together
+    weight = torch.cat([l.weight for l in layers], dim=0)
+    original_shape = weight.shape
+
+    # The weights are reshaped to be organized by quantization group
+    if self.quantize_config.group_size > 1:
+        weight = weight.view(-1, self.quantize_config.group_size)
+
+    # Calculates the relative magnitude of the weights within each of the quantization groups,
+    # and rescales each group individually so that each group has weights on a 0-1 scale.
+    w_scale = weight.abs() / weight.abs().amax(dim=1, keepdim=True)
+
+    # Resizes the rescaled weight matrix back up to its original dimensions
+    w_scale = w_scale.view(original_shape)
+
+    # Gets the average rescaled magnitude for each output channel
+    w_mean = w_scale.mean(0)
+    del w_scale
+    del weight
+
+    # Compute per-channel mean of the input activations
+    x_mean = inp.abs().view(-1, inp.shape[-1]).mean(0)
+
+    original_output = module2inspect(inp, **kwargs)
+    if isinstance(original_output, tuple):
+        original_output = original_output[0]
+
+    """
+    Compute loss and select best scales
+
+    L(s) = || Q(W * s) (s^-1 * X) - W * X ||
+    Q: weight quantization function | pseudo_quantize_tensor(W * s)
+    X: inputs from calib dataset    | X
+    W: original weights in FP16     | layer
+    s: per channel scaling factor   | s^-1 * X
+    """
+
+    n_grid = 20 # Arbitrary number of scales to try
+    best_scales = torch.Tensor()
+    best_ratio = -1
+    best_error = float("inf")
+
+    org_sd = {k: v.cpu() for k, v in module2inspect.state_dict().items()}
+
+    inp.to(device)
+    x_mean = x_mean.view(-1).to(device)
+    w_mean = w_mean.view(-1).to(device)
+
+    for ratio in range(n_grid):
+        # create new scales
+        ratio = ratio / n_grid
+
+        # NOTE: s^-1 * x is fused here, according to paper
+        # Used duo_scaling of AutoAWQ as a default.
+        scales = (x_mean.pow(ratio) / w_mean.pow(1 - ratio)).clamp(min=1e-4)
+        scales = scales / (scales.max() * scales.min()).sqrt()
+        scales_view = scales.view(1, -1).to(device)
+
+        # TODO: This code is using naive fake quant.
+        # Check if GPTQ fake quant works.
+
+        # Q(W * s)
+        for idx, fc in enumerate(layers):
+            fc.weight.mul_(scales_view)
+            # q = copy.deepcopy(qlist[idx])
+            # q.set_layer(fc)
+            # q.fasterquant(
+            #     percdamp=self.quantize_config.damp_percent,
+            #     group_size=self.quantize_config.group_size,
+            #     actorder=self.quantize_config.desc_act,
+            #     static_groups=self.quantize_config.static_groups,
+            # )
+            fc.weight.data = awq_pseudo_quantizer(self, fc.weight.data)[0]
+            fc.weight.div_(scales_view)
+            # q.free()
+
+        # W * X
+        with torch.no_grad():
+            int_w_output = module2inspect(inp, **kwargs)
+            if isinstance(int_w_output, tuple):
+                int_w_output = int_w_output[0]
+
+        # compute mean squared error (L2 norm)
+        loss = (
+            (original_output - int_w_output).float().pow(2).mean().item()
+        )  # NOTE: float prevents overflow
+        del int_w_output
+
+        if loss < best_error:
+            best_error = loss
+            best_ratio = ratio
+            best_scales = scales.clone()
+        del scales
+        module2inspect.load_state_dict(org_sd)
+
+    if best_ratio == -1:
+        raise Exception("No best ratio found")
+
+    assert torch.isnan(best_scales).sum() == 0, best_scales
+    del x_mean, w_mean
+
+    # Apply best scales
+    best_scales.to(device)
+    prev_op.to(device)
+    for fc in layers:
+        fc.to(device)
+
+    if (
+      isinstance(prev_op, nn.Linear)
+      and isinstance(layers[0], nn.Linear)
+    ):
+        # single FC to FC(s)
+        prev_op.weight[-best_scales.size(0):].div_(best_scales.view(-1, 1))
+
+        if prev_op.bias is not None:
+            prev_op.bias.div_(best_scales.view(-1))
+
+        for fc in layers:
+            fc.weight.mul_(best_scales.view(1, -1))
+
+        for p in prev_op.parameters():
+            assert torch.isnan(p).sum() == 0, p
+
+        for fc in layers:
+            for p in fc.parameters():
+                assert torch.isnan(p).sum() == 0, p
+
+    elif (
+        isinstance(prev_op, nn.LayerNorm)
+        or "rmsnorm" in str(prev_op.__class__).lower()
+    ):
+        # Norm to FC(s)
+
+        # GemmaRMSNorm is different from Llama's in that it multiplies
+        # (1 + weight) to the output, instead of just weight.
+        if "Gemma" in str(prev_op.__class__):
+            prev_op.weight += 1
+            prev_op.weight.div_(best_scales)
+            prev_op.weight -= 1
+        else:
+            prev_op.weight.div_(best_scales)
+
+        if hasattr(prev_op, "bias") and prev_op.bias is not None:
+            prev_op.bias.div_(best_scales)
+
+        for fc in layers:
+            fc.weight.mul_(best_scales.view(1, -1))
+
+        for p in prev_op.parameters():
+            assert torch.isnan(p).sum() == 0, p
+
+        for fc in layers:
+            for p in fc.parameters():
+                assert torch.isnan(p).sum() == 0, p
+
+    elif "gelu" in str(prev_op.__class__).lower():
+        # GELU to FC(s), GPT-like models
+        def gelu_with_scale(m, i, o, scale:torch.Tensor):
+            return o / scale.view(1, 1, -1).to(i.device)
+
+        prev_op.register_forward_hook(functools.partial(gelu_with_scale, scale=best_scales))
+
+        for fc in layers:
+            fc.weight.mul_(best_scales.view(1, -1))
+
+        for fc in layers:
+            for p in fc.parameters():
+                assert torch.isnan(p).sum() == 0, p
+
+    else:
+        raise NotImplementedError(f"Unsupported layer type: {prev_op.__class__}")
+
+    gc.collect()
+    torch.cuda.empty_cache()
+    return best_scales
+
+
+@torch.no_grad()
+def apply_awq_clip(
+    self,
+    names: List[str],
+    layers: List[nn.Linear],
+    # qlist: List[GPTQ],
+    inp: Dict[str, torch.Tensor],
+):
+    avoid_clip = ["q_", "k_", "query", "key", "Wqkv"]
+
+    for idx, name in enumerate(names):
+        if any([_ in name for _ in avoid_clip]):
+            continue
+
+        fc = layers[idx]
+        device = CUDA_0 if torch.cuda.is_available() else CPU
+        fc.to(device)
+        input_feat = inp[name].to(device)
+
+        w = fc.weight
+
+        assert w.dim() == 2
+        orig_w_shape = w.shape
+
+        # Reshape weights to be organized by quantization group
+        # weight = [co, ci]      -> [co, 1, n_group, groupsize]
+        # inp    = [n_token, ci] -> [1, n_token, n_group, groupsize]
+
+        max_shrink = 0.5
+        n_grid = 20
+
+        group_size = self.quantize_config.group_size if self.quantize_config.group_size > 0 else orig_w_shape[1]
+        input_feat = input_feat.view(-1, input_feat.shape[-1])
+        input_feat = input_feat.reshape(1, input_feat.shape[0], -1, group_size)
+        w = w.reshape(orig_w_shape[0], 1, -1, group_size)
+
+        best_max_val_all = []
+
+        lin = copy.deepcopy(fc)
+
+        # TODO: This code is using naive fake quant.
+        # Check if GPTQ fake quant works.
+
+        # TODO: Check changing sample token or avail_token dynamically.
+
+        # Sample tokens for faster clipping
+        n_sample_token = 512
+        input_feat_trim = input_feat[:, 0 :: input_feat.shape[1] // n_sample_token]
+        del input_feat
+
+        avail_token = 256
+        for i_b in range(orig_w_shape[0] // avail_token):
+            w_part = w[i_b * avail_token : (i_b + 1) * avail_token]
+
+            org_max_val = w_part.abs().amax(dim=-1, keepdim=True)  # co, 1, n_group, 1
+
+            best_max_val = org_max_val.clone()
+            min_errs = torch.ones_like(org_max_val) * 1e9
+            input_feat_trim = input_feat_trim.to(w.device)
+            org_out = (input_feat_trim * w_part).sum(dim=-1)  # co, n_token, n_group
+
+            for i_s in range(int(max_shrink * n_grid)):
+                max_val = org_max_val * (1 - i_s / n_grid)
+                min_val = -max_val
+                lin.weight.data = torch.clamp(w_part, min_val, max_val)
+                # q = copy.deepcopy(qlist[idx])
+                # q.set_layer(lin)
+                # q.fasterquant(
+                #     percdamp=self.quantize_config.damp_percent,
+                #     group_size=self.quantize_config.group_size,
+                #     actorder=self.quantize_config.desc_act,
+                #     static_groups=self.quantize_config.static_groups,
+                # )
+                lin.weight.data = awq_pseudo_quantizer(self, lin.weight.data)[0]
+                lin.weight.data = lin.weight.data.reshape(w_part.shape)
+                cur_out = (input_feat_trim * lin.weight).sum(dim=-1)
+
+                # co, 1, n_group, 1
+                err = (cur_out - org_out).pow(2).mean(dim=1).view(min_errs.shape)
+                del cur_out
+                # q.free()
+                cur_best_idx = err < min_errs
+                min_errs[cur_best_idx] = err[cur_best_idx]
+                best_max_val[cur_best_idx] = max_val[cur_best_idx]
+
+            best_max_val_all.append(best_max_val)
+            del org_out
+
+        del lin
+        max_val = torch.cat(best_max_val_all, dim=0).squeeze(1)
+        max_val.to(device)
+
+        fc.weight.data = fc.weight.data.reshape(*max_val.shape[:2], -1)
+        fc.weight.data = torch.clamp(fc.weight.data, -max_val, max_val)
+        fc.weight.data = fc.weight.data.reshape(*orig_w_shape)
+
+        torch.cuda.empty_cache()
 
 def pack_from_tensors(
     unpacked_qweight: torch.Tensor,

@@ -1,10 +1,13 @@
-from torch import device
+import torch
 
 from ..utils.import_utils import compare_transformers_version
 
 
-CPU = device("cpu")
-CUDA_0 = device("cuda:0")
+CPU = torch.device("cpu")
+device_memory = []
+for i in range(torch.cuda.device_count()):
+    device_memory.append(torch.cuda.mem_get_info(i)[0])
+CUDA_0 = torch.device(f"cuda:{device_memory.index(max(device_memory))}")
 
 SUPPORTED_MODELS = [
     "bloom",
